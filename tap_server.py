@@ -357,6 +357,7 @@ class Handler(BaseHTTPRequestHandler):
                 stderr=subprocess.PIPE,
                 stdin=subprocess.DEVNULL,
                 text=True,
+                encoding="utf-8",
                 errors="replace",
                 start_new_session=True,
             )

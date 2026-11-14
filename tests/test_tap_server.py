@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -856,6 +857,25 @@ class TapServerTests(unittest.TestCase):
         code, body = self.post_tap("slow", token=self.token, origin="null")
         self.assertEqual(code, 504)
         self.assertIn(b"command timed out", body)
+
+    def test_output_is_decoded_as_utf8_whatever_the_locale(self):
+        """source: the command's output is decoded as UTF-8 with replacement, not with the locale's encoding."""
+        real_popen = subprocess.Popen
+        calls = []
+
+        def recorder(*args, **kwargs):
+            calls.append(kwargs)
+            return real_popen(*args, **kwargs)
+
+        self.set_commands({"bytes": ["/bin/sh", "-c", "printf '\\377ok'"]})
+        with unittest.mock.patch.object(self.tap.subprocess, "Popen", side_effect=recorder):
+            code, body = self.post_tap("bytes", token=self.token, origin="null")
+        self.assertEqual(code, 200)
+        self.assertIn("\ufffd", body.decode("utf-8"))
+        ran = [kw for kw in calls if kw.get("stdout") == subprocess.PIPE]
+        self.assertEqual(len(ran), 1)
+        self.assertEqual(ran[0].get("encoding"), "utf-8")
+        self.assertEqual(ran[0].get("errors"), "replace")
 
 
 if __name__ == "__main__":

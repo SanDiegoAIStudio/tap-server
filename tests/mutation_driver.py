@@ -92,6 +92,7 @@ MUTATIONS = [
         "                stderr=subprocess.PIPE,\n"
         "                stdin=subprocess.DEVNULL,\n"
         "                text=True,\n"
+        '                encoding="utf-8",\n'
         '                errors="replace",\n'
         "                start_new_session=True,\n"
         "            )\n",
@@ -100,6 +101,7 @@ MUTATIONS = [
         "                stdout=subprocess.PIPE,\n"
         "                stderr=subprocess.PIPE,\n"
         "                text=True,\n"
+        '                encoding="utf-8",\n'
         '                errors="replace",\n'
         "            )\n",
     ),
@@ -354,6 +356,12 @@ MUTATIONS = [
         "output is decoded strictly, so a timeout after it answers 500",
         "test_a_timeout_answers_504_even_after_output_that_is_not_utf8",
         '                errors="replace",\n',
+        "",
+    ),
+    (
+        "output decoded with the locale encoding",
+        "test_output_is_decoded_as_utf8_whatever_the_locale",
+        '                encoding="utf-8",\n',
         "",
     ),
 ]
