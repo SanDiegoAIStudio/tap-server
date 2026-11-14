@@ -32,8 +32,10 @@ MUTATIONS = [
     (
         "token check on /tap",
         "test_token_missing_on_tap",
-        "        if not token_matches(presented, load_command_token()):\n",
-        "        if False:\n",
+        "        if not token_matches(presented, token):\n"
+        '            self._reject(403, "bad or missing tap token")\n',
+        "        if False:\n"
+        '            self._reject(403, "bad or missing tap token")\n',
     ),
     (
         "origin rule on /tap",
@@ -84,15 +86,20 @@ MUTATIONS = [
     (
         "listed command",
         "test_listed_command_returns_output",
-        "            proc = subprocess.run(\n"
+        "            proc = subprocess.Popen(\n"
         "                argv,\n"
-        "                capture_output=True,\n"
-        "                text=True,\n"
-        "                timeout=COMMAND_TIMEOUT,\n"
-        "                shell=False,\n"
+        "                stdout=subprocess.PIPE,\n"
+        "                stderr=subprocess.PIPE,\n"
         "                stdin=subprocess.DEVNULL,\n"
+        "                text=True,\n"
+        "                start_new_session=True,\n"
         "            )\n",
-        '            proc = subprocess.CompletedProcess(argv, 0, "", "")\n',
+        "            proc = subprocess.Popen(\n"
+        '                ["/bin/echo", "x"],\n'
+        "                stdout=subprocess.PIPE,\n"
+        "                stderr=subprocess.PIPE,\n"
+        "                text=True,\n"
+        "            )\n",
     ),
     (
         "body size cap",
@@ -103,22 +110,26 @@ MUTATIONS = [
     (
         "page token check accepts the command token",
         "test_command_token_refused_on_page",
-        "        if not token_matches(presented, load_page_token()):\n",
-        "        if not (token_matches(presented, load_page_token())"
-        " or token_matches(presented, load_command_token())):\n",
+        "        if not token_matches(presented, token):\n"
+        '            self._reject(403, "bad or missing page token")\n',
+        "        if not (token_matches(presented, token)"
+        " or token_matches(presented, load_command_token())):\n"
+        '            self._reject(403, "bad or missing page token")\n',
     ),
     (
         "command token check accepts the page token",
         "test_page_token_refused_on_tap",
-        "        if not token_matches(presented, load_command_token()):\n",
-        "        if not (token_matches(presented, load_command_token())"
-        " or token_matches(presented, load_page_token())):\n",
+        "        if not token_matches(presented, token):\n"
+        '            self._reject(403, "bad or missing tap token")\n',
+        "        if not (token_matches(presented, token)"
+        " or token_matches(presented, load_page_token())):\n"
+        '            self._reject(403, "bad or missing tap token")\n',
     ),
     (
         "token before body on /page",
         "test_page_checks_token_before_body",
         '        presented = self.headers.get("X-Tap-Token")\n'
-        "        if not token_matches(presented, load_page_token()):\n"
+        "        if not token_matches(presented, token):\n"
         '            self._reject(403, "bad or missing page token")\n'
         "            return\n"
         "        body = self.read_json_object()\n"
@@ -128,7 +139,7 @@ MUTATIONS = [
         "        if body is None:\n"
         "            return\n"
         '        presented = self.headers.get("X-Tap-Token")\n'
-        "        if not token_matches(presented, load_page_token()):\n"
+        "        if not token_matches(presented, token):\n"
         '            self._reject(403, "bad or missing page token")\n'
         "            return\n",
     ),
@@ -204,8 +215,8 @@ MUTATIONS = [
     (
         "command timeout argument removed",
         "test_command_timeout_answers_504",
-        "                timeout=COMMAND_TIMEOUT,\n",
-        "",
+        "                stdout, stderr = proc.communicate(timeout=COMMAND_TIMEOUT)\n",
+        "                stdout, stderr = proc.communicate()\n",
     ),
     (
         "commands file kept after the first read",
@@ -278,6 +289,58 @@ MUTATIONS = [
         "        if True:\n"
         '            self._send(200, "ok")\n'
         "            return\n",
+    ),
+    (
+        "token file chmod removed",
+        "test_a_loose_token_file_is_set_back_to_600",
+        "                os.chmod(str(path), TOKEN_FILE_MODE)\n",
+        "                pass\n",
+    ),
+    (
+        "token script file chmod removed",
+        "test_a_loose_token_script_file_is_set_back_to_600",
+        "            os.chmod(str(js_path), TOKEN_JS_MODE)\n",
+        "            pass\n",
+    ),
+    (
+        "token file written in place with the temporary file left behind",
+        "test_a_token_rewrite_leaves_no_temporary_file",
+        "            os.replace(str(tmp), str(path))\n",
+        '            path.write_text(text, encoding="utf-8")\n',
+    ),
+    (
+        "unreadable token file answer removed",
+        "test_an_unreadable_token_file_answers_500",
+        "        except (OSError, UnicodeDecodeError):\n",
+        "        except ZeroDivisionError:\n",
+    ),
+    (
+        "recursion error not caught",
+        "test_deeply_nested_json_answers_400",
+        "        except RecursionError:\n",
+        "        except ZeroDivisionError:\n",
+    ),
+    (
+        "timeout stops only the direct child",
+        "test_a_timeout_also_stops_the_processes_the_command_started",
+        "                    os.killpg(proc.pid, signal.SIGKILL)\n",
+        "                    proc.kill()\n",
+    ),
+    (
+        "reply cut removed",
+        "test_a_long_reply_is_cut_with_a_note",
+        "        if len(reply) > MAX_REPLY:\n",
+        "        if False:\n",
+    ),
+    (
+        "page log opened with mode 644 and no fchmod",
+        "test_the_page_log_is_mode_600",
+        "            fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, PAGE_LOG_MODE)\n"
+        "            try:\n"
+        "                os.fchmod(fd, PAGE_LOG_MODE)\n",
+        "            fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)\n"
+        "            try:\n"
+        "                pass\n",
     ),
 ]
 

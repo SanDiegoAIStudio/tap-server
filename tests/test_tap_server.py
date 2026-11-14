@@ -6,6 +6,7 @@ import http.client
 import json
 import os
 import secrets
+import subprocess
 import sys
 import tempfile
 import threading
@@ -691,6 +692,131 @@ class TapServerTests(unittest.TestCase):
         code, body = self.request("/tap?cmd=echo", "GET", {"Origin": "null"}, None)
         self.assertEqual(code, 403)
         self.assertNotIn(b"tap-ok", body)
+
+
+    def test_a_loose_token_file_is_set_back_to_600(self):
+        """source: a token file found with looser permissions is set back to mode 600 when read."""
+        os.chmod(str(self.token_file), 0o644)
+        before = self.token_file.read_text(encoding="utf-8")
+        code, _body = self.post_tap("echo", token=self.token, origin="null")
+        self.assertEqual(code, 200)
+        self.assertEqual(self.token_file.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.token_file.read_text(encoding="utf-8"), before)
+
+    def test_a_loose_token_script_file_is_set_back_to_600(self):
+        """source: a token script file found with looser permissions is set back to mode 600."""
+        script = self.token_file.parent / "tap-token.js"
+        code, _body = self.post_tap("echo", token=self.token, origin="null")
+        self.assertEqual(code, 200)
+        before = script.read_text(encoding="utf-8")
+        os.chmod(str(script), 0o644)
+        code, _body = self.post_tap("echo", token=self.token, origin="null")
+        self.assertEqual(code, 200)
+        self.assertEqual(script.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(script.read_text(encoding="utf-8"), before)
+
+    def test_a_token_rewrite_leaves_no_temporary_file(self):
+        """source: a token file written again is moved into place and leaves no temporary file."""
+        fresh = Path(self.tmp.name) / "fresh-tmp"
+        self.point_token_files_at(fresh)
+        code, _body = self.post_tap("echo", token=self.token, origin="null")
+        self.assertEqual(code, 403)
+        self.assertTrue((fresh / "token").exists())
+        self.assertTrue((fresh / "tap-token.js").exists())
+        (fresh / "token").unlink()
+        code, _body = self.post_tap("echo", token=self.token, origin="null")
+        self.assertEqual(code, 403)
+        names = [entry.name for entry in fresh.iterdir()]
+        self.assertIn("token", names)
+        self.assertEqual([name for name in names if ".tmp." in name], [])
+
+    def test_an_unreadable_token_file_answers_500(self):
+        """source: a token file that cannot be read answers 500 and runs nothing, not a dropped connection."""
+        for token_file, kind in ((self.token_file, "tap"), (self.page_token_file, "page")):
+            good = token_file.read_bytes()
+            self.addCleanup(token_file.write_bytes, good)
+            token_file.write_bytes(b"\xff\xfe\xfa")
+            if kind == "tap":
+                code, body = self.post_tap("echo", token=self.token, origin="null")
+            else:
+                code, body = self.post_page(
+                    {"slug": "demo", "kind": "note", "text": "x"},
+                    token=self.page_token,
+                    origin="null",
+                )
+            self.assertEqual(code, 500, kind)
+            self.assertEqual(body, b"token file is unreadable", kind)
+            code, body = self.request("/health", "GET", {}, None)
+            self.assertEqual((code, body), (200, b"ok"), kind)
+            token_file.write_bytes(good)
+        self.assertEqual(self.page_lines(), [])
+
+    def test_deeply_nested_json_answers_400(self):
+        """source: a body nested far past the recursion limit answers 400 and the server keeps answering."""
+        payload = ("[" * 50000 + "]" * 50000).encode("ascii")
+        code, body = self.request(
+            "/page",
+            "POST",
+            {"Origin": "null", "X-Tap-Token": self.page_token},
+            payload,
+        )
+        self.assertEqual(code, 400)
+        self.assertEqual(body, b"body must be JSON")
+        code, body = self.request("/health", "GET", {}, None)
+        self.assertEqual((code, body), (200, b"ok"))
+
+    def test_a_timeout_also_stops_the_processes_the_command_started(self):
+        """source: on a timeout the command's whole process group is stopped, so a grandchild cannot hold the reply open."""
+        previous = self.tap.COMMAND_TIMEOUT
+
+        def restore():
+            self.tap.COMMAND_TIMEOUT = previous
+
+        def stop_orphans():
+            # Only matters when the rule is broken: leave no sleep behind.
+            listing = subprocess.run(
+                ["/bin/ps", "-axo", "pid=,ppid=,command="],
+                capture_output=True,
+                text=True,
+            ).stdout
+            for line in listing.splitlines():
+                parts = line.split(None, 2)
+                if len(parts) == 3 and parts[1] == "1" and parts[2] == "sleep 30":
+                    try:
+                        os.kill(int(parts[0]), 9)
+                    except OSError:
+                        pass
+
+        self.addCleanup(restore)
+        self.addCleanup(stop_orphans)
+        self.tap.COMMAND_TIMEOUT = 1
+        self.set_commands({"slow": ["/bin/sh", "-c", "sleep 30 & sleep 30"]})
+        started = time.time()
+        code, body = self.post_tap("slow", token=self.token, origin="null")
+        elapsed = time.time() - started
+        self.assertEqual(code, 504)
+        self.assertIn(b"command timed out", body)
+        self.assertLess(elapsed, 5)
+
+    def test_a_long_reply_is_cut_with_a_note(self):
+        """source: a reply longer than 100000 characters is cut there with a line saying so."""
+        self.set_commands(
+            {"big": ["/bin/sh", "-c", "head -c 250000 /dev/zero | tr '\\000' x"]}
+        )
+        code, body = self.post_tap("big", token=self.token, origin="null")
+        self.assertEqual(code, 200)
+        self.assertEqual(body, b"x" * 100000 + b"\n(reply cut at 100000 characters)")
+
+    def test_the_page_log_is_mode_600(self):
+        """source: the page log is created with mode 600 and set back to 600 when found looser."""
+        note = {"slug": "demo", "kind": "note", "text": "x"}
+        code, _body = self.post_page(note, token=self.page_token, origin="null")
+        self.assertEqual(code, 204)
+        self.assertEqual(self.page_log.stat().st_mode & 0o777, 0o600)
+        os.chmod(str(self.page_log), 0o644)
+        code, _body = self.post_page(note, token=self.page_token, origin="null")
+        self.assertEqual(code, 204)
+        self.assertEqual(self.page_log.stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == "__main__":

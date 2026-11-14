@@ -14,6 +14,7 @@ import json
 import os
 import re
 import secrets
+import signal
 import subprocess
 import sys
 import threading
@@ -27,6 +28,8 @@ MAX_BODY = 120_000
 COMMAND_TIMEOUT = 90
 TOKEN_FILE_MODE = 0o600
 TOKEN_JS_MODE = 0o600
+PAGE_LOG_MODE = 0o600
+MAX_REPLY = 100_000
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,120}$")
 PAGE_KINDS = {"check", "note"}
 CARD_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
@@ -67,16 +70,29 @@ def listen_port():
 
 
 def _write_private(path, text, mode):
-    """Write text to path and leave the file at exactly this mode."""
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    """Write text to path and leave the file at exactly this mode.
+
+    The text goes into a new file beside path and is moved into place, so a
+    reader sees the old file or the whole new one, never half of it.
+    """
+    tmp = path.parent / (".%s.tmp.%s" % (path.name, secrets.token_hex(4)))
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
     try:
-        os.fchmod(fd, mode)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            fd = -1
-            handle.write(text)
-    finally:
-        if fd != -1:
-            os.close(fd)
+        try:
+            os.fchmod(fd, mode)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                fd = -1
+                handle.write(text)
+            os.replace(str(tmp), str(path))
+        finally:
+            if fd != -1:
+                os.close(fd)
+    except BaseException:
+        try:
+            os.unlink(str(tmp))
+        except OSError:
+            pass
+        raise
 
 
 def _sync_token_js(js_path, variable, token):
@@ -89,6 +105,8 @@ def _sync_token_js(js_path, variable, token):
         if not js_path.exists() or js_path.read_text(encoding="utf-8") != want:
             js_path.parent.mkdir(parents=True, exist_ok=True)
             _write_private(js_path, want, TOKEN_JS_MODE)
+        elif (js_path.stat().st_mode & 0o777) != TOKEN_JS_MODE:
+            os.chmod(str(js_path), TOKEN_JS_MODE)
     except OSError:
         pass
 
@@ -103,6 +121,8 @@ def _load_token(path, js_name, variable):
         path.parent.mkdir(parents=True, exist_ok=True)
         token = ""
         if path.exists():
+            if (path.stat().st_mode & 0o777) != TOKEN_FILE_MODE:
+                os.chmod(str(path), TOKEN_FILE_MODE)
             token = path.read_text(encoding="utf-8").strip()
         if not token:
             token = secrets.token_hex(24)
@@ -185,8 +205,15 @@ def append_page_row(row):
     try:
         with _PAGE_LOCK:
             path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "a", encoding="utf-8") as handle:
-                handle.write(line)
+            fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, PAGE_LOG_MODE)
+            try:
+                os.fchmod(fd, PAGE_LOG_MODE)
+                with os.fdopen(fd, "a", encoding="utf-8") as handle:
+                    fd = -1
+                    handle.write(line)
+            finally:
+                if fd != -1:
+                    os.close(fd)
     except OSError:
         return 500, "page log append failed"
     return 204, ""
@@ -274,10 +301,21 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             self._send(400, "body must be JSON")
             return None
+        except RecursionError:
+            self._send(400, "body must be JSON")
+            return None
         if not isinstance(body, dict):
             self._send(400, "body must be a JSON object")
             return None
         return body
+
+    def _route_token(self, loader):
+        """Token for the route, or None after answering 500 when its file is unreadable."""
+        try:
+            return loader()
+        except (OSError, UnicodeDecodeError):
+            self._reject(500, "token file is unreadable")
+            return None
 
     def do_POST(self):
         parsed = urlparse(self.path)
@@ -293,8 +331,11 @@ class Handler(BaseHTTPRequestHandler):
         if origin_is_web(self.headers.get("Origin")):
             self._reject(403, "web origins are not allowed to tap")
             return
+        token = self._route_token(load_command_token)
+        if token is None:
+            return
         presented = self.headers.get("X-Tap-Token")
-        if not token_matches(presented, load_command_token()):
+        if not token_matches(presented, token):
             self._reject(403, "bad or missing tap token")
             return
         if self.read_body() is None:
@@ -310,29 +351,45 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, "invalid tap: cmd=%r" % cmd)
             return
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 argv,
-                capture_output=True,
-                text=True,
-                timeout=COMMAND_TIMEOUT,
-                shell=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 stdin=subprocess.DEVNULL,
+                text=True,
+                start_new_session=True,
             )
-        except subprocess.TimeoutExpired:
-            self._send(504, "command timed out")
-            return
+            try:
+                stdout, stderr = proc.communicate(timeout=COMMAND_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                # Stop the whole group, or a grandchild holding the pipe keeps us waiting.
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                self._send(504, "command timed out")
+                return
         except Exception as error:
             self._send(500, "tap failed: %s" % type(error).__name__)
             return
-        reply = proc.stdout.strip() or proc.stderr.strip() or "(no reply)"
+        reply = stdout.strip() or stderr.strip() or "(no reply)"
+        if len(reply) > MAX_REPLY:
+            reply = reply[:MAX_REPLY] + "\n(reply cut at 100000 characters)"
         self._send(200, reply)
 
     def handle_page(self):
         if origin_is_web(self.headers.get("Origin")):
             self._reject(403, "web origins are not allowed")
             return
+        token = self._route_token(load_page_token)
+        if token is None:
+            return
         presented = self.headers.get("X-Tap-Token")
-        if not token_matches(presented, load_page_token()):
+        if not token_matches(presented, token):
             self._reject(403, "bad or missing page token")
             return
         body = self.read_json_object()
