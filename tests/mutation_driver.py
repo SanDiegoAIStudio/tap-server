@@ -92,6 +92,7 @@ MUTATIONS = [
         "                stderr=subprocess.PIPE,\n"
         "                stdin=subprocess.DEVNULL,\n"
         "                text=True,\n"
+        '                errors="replace",\n'
         "                start_new_session=True,\n"
         "            )\n",
         "            proc = subprocess.Popen(\n"
@@ -99,6 +100,7 @@ MUTATIONS = [
         "                stdout=subprocess.PIPE,\n"
         "                stderr=subprocess.PIPE,\n"
         "                text=True,\n"
+        '                errors="replace",\n'
         "            )\n",
     ),
     (
@@ -341,6 +343,18 @@ MUTATIONS = [
         "            fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)\n"
         "            try:\n"
         "                pass\n",
+    ),
+    (
+        "output is decoded strictly",
+        "test_output_that_is_not_utf8_is_shown_with_the_replacement_character",
+        '                errors="replace",\n',
+        "",
+    ),
+    (
+        "output is decoded strictly, so a timeout after it answers 500",
+        "test_a_timeout_answers_504_even_after_output_that_is_not_utf8",
+        '                errors="replace",\n',
+        "",
     ),
 ]
 

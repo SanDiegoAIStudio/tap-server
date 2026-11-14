@@ -818,6 +818,45 @@ class TapServerTests(unittest.TestCase):
         self.assertEqual(code, 204)
         self.assertEqual(self.page_log.stat().st_mode & 0o777, 0o600)
 
+    def test_output_that_is_not_utf8_is_shown_with_the_replacement_character(self):
+        """source: a command that prints bytes that are not UTF-8 still gets its reply, with the replacement character."""
+        self.set_commands({"bytes": ["/bin/sh", "-c", "printf '\\377ok'"]})
+        code, body = self.post_tap("bytes", token=self.token, origin="null")
+        self.assertEqual(code, 200)
+        text = body.decode("utf-8")
+        self.assertIn("ok", text)
+        self.assertIn("\ufffd", text)
+
+    def test_a_timeout_answers_504_even_after_output_that_is_not_utf8(self):
+        """source: a command that prints bytes that are not UTF-8 and then outlives the timeout answers 504, not 500."""
+        previous = self.tap.COMMAND_TIMEOUT
+
+        def restore():
+            self.tap.COMMAND_TIMEOUT = previous
+
+        def stop_orphans():
+            # Only matters when the rule is broken: leave no sleep behind.
+            listing = subprocess.run(
+                ["/bin/ps", "-axo", "pid=,ppid=,command="],
+                capture_output=True,
+                text=True,
+            ).stdout
+            for line in listing.splitlines():
+                parts = line.split(None, 2)
+                if len(parts) == 3 and parts[1] == "1" and parts[2] == "sleep 30":
+                    try:
+                        os.kill(int(parts[0]), 9)
+                    except OSError:
+                        pass
+
+        self.addCleanup(restore)
+        self.addCleanup(stop_orphans)
+        self.tap.COMMAND_TIMEOUT = 1
+        self.set_commands({"slow": ["/bin/sh", "-c", "printf '\\377'; exec sleep 30"]})
+        code, body = self.post_tap("slow", token=self.token, origin="null")
+        self.assertEqual(code, 504)
+        self.assertIn(b"command timed out", body)
+
 
 if __name__ == "__main__":
     unittest.main()
