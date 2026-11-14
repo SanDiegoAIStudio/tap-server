@@ -1,0 +1,5 @@
+{
+  "date": ["date"],
+  "hostname": ["hostname"],
+  "list": ["ls", "run"]
+}

@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline' file:; connect-src http://127.0.0.1:7373">
+<title>tap server</title>
+<style>
+  body {
+    font-family: sans-serif;
+    margin: 2rem auto;
+    max-width: 36rem;
+    line-height: 1.45;
+    color: #1a1a1a;
+    background: #fff;
+  }
+  label { display: block; margin: 0.8rem 0 0.3rem; }
+  input[type="text"], textarea {
+    font: inherit;
+    width: 100%;
+    box-sizing: border-box;
+  }
+  textarea { min-height: 6rem; }
+  button {
+    font: inherit;
+    margin: 0 0.5rem 0.5rem 0;
+    padding: 0.4rem 0.8rem;
+  }
+  pre {
+    white-space: pre-wrap;
+    background: #f4f4f4;
+    padding: 0.8rem;
+    min-height: 2rem;
+  }
+</style>
+</head>
+<body>
+<h1>tap server</h1>
+<p>This page runs three commands on your machine, and it can save a checkbox or a note. It reads two token files that the server keeps in the run folder, so there is nothing to paste. If the server is not answering, the page keeps the tap here and sends it when the server answers again.</p>
+<p>Page name: demo</p>
+<p>
+  <button type="button" id="date">Date</button>
+  <button type="button" id="hostname">Hostname</button>
+  <button type="button" id="list">List run</button>
+</p>
+<p><label><input id="check" type="checkbox"> Checkbox</label></p>
+<label for="note">Note</label>
+<textarea id="note"></textarea>
+<p><button type="button" id="save">Save note</button></p>
+<p id="status"></p>
+<pre id="out"></pre>
+<script src="run/tap-token.js"></script>
+<script src="run/page-token.js"></script>
+<script>
+var BASE = "http://127.0.0.1:7373";
+var PAGE = "demo";
+var QUEUE_KEY = "tap-server-queue";
+var flushing = false;
+var paused = false;
+var timer = null;
+
+function byId(id) {
+  return document.getElementById(id);
+}
+
+function tokensMissing() {
+  return typeof window.TAP_TOKEN === "undefined" || typeof window.PAGE_TOKEN === "undefined";
+}
+
+var MISSING_TEXT = "The token files were not found. Start the server from this folder (python3 tap_server.py) and reload this page.";
+var REFUSED_TEXT = "The server refused the token. Reload this page so it reads the token files again.";
+
+function setStatus(text) {
+  byId("status").textContent = text;
+}
+
+function show(status, text) {
+  if (status === 204) {
+    byId("out").textContent = "saved";
+    return;
+  }
+  byId("out").textContent = text ? (status + " " + text) : String(status);
+}
+
+function readQueue() {
+  try {
+    var raw = localStorage.getItem(QUEUE_KEY);
+    var parsed = raw ? JSON.parse(raw) : [];
+    return Object.prototype.toString.call(parsed) === "[object Array]" ? parsed : [];
+  } catch (error) {
+    return [];
+  }
+}
+
+function writeQueue(items) {
+  localStorage.setItem(QUEUE_KEY, JSON.stringify(items));
+}
+
+function stamp() {
+  return new Date().toISOString();
+}
+
+function sendItem(item) {
+  var headers = {
+    "X-Tap-Token": item.op === "tap" ? window.TAP_TOKEN : window.PAGE_TOKEN
+  };
+  var url = BASE + (item.op === "tap" ? "/tap?cmd=" + encodeURIComponent(item.cmd) : "/page");
+  var opts = {method: "POST", headers: headers, cache: "no-store"};
+  if (item.op === "page") {
+    headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(item.body);
+  }
+  return fetch(url, opts).then(function (response) {
+    return response.text().then(function (text) {
+      return {status: response.status, text: text};
+    });
+  });
+}
+
+function clearTimer() {
+  if (timer !== null) {
+    clearInterval(timer);
+    timer = null;
+  }
+}
+
+function drain() {
+  var items = readQueue();
+  if (!items.length || paused) return Promise.resolve();
+  return sendItem(items[0]).then(function (result) {
+    if (result.status === 403) {
+      paused = true;
+      clearTimer();
+      show(result.status, result.text);
+      setStatus(REFUSED_TEXT + " " + readQueue().length + " waiting on this page.");
+      return;
+    }
+    items.shift();
+    writeQueue(items);
+    show(result.status, result.text);
+    return drain();
+  });
+}
+
+function flush() {
+  var items;
+  if (flushing || paused) return;
+  items = readQueue();
+  if (!items.length) {
+    clearTimer();
+    return;
+  }
+  if (tokensMissing()) {
+    setStatus(MISSING_TEXT + " " + items.length + " waiting on this page.");
+    return;
+  }
+  flushing = true;
+  fetch(BASE + "/health", {cache: "no-store"}).then(function (response) {
+    if (!response.ok) throw new Error("down");
+    return drain();
+  }).then(function () {
+    flushing = false;
+    if (!readQueue().length) {
+      clearTimer();
+      setStatus("server answering");
+    }
+  }).catch(function () {
+    flushing = false;
+    setStatus("server is not answering. " + readQueue().length + " waiting on this page.");
+  });
+}
+
+function ensureTimer() {
+  flush();
+  if (timer === null) timer = setInterval(flush, 2000);
+}
+
+function act(item) {
+  if (tokensMissing()) {
+    setStatus(MISSING_TEXT);
+    return;
+  }
+  if (paused) {
+    setStatus(REFUSED_TEXT);
+    return;
+  }
+  sendItem(item).then(function (result) {
+    show(result.status, result.text);
+    if (result.status === 403) {
+      paused = true;
+      clearTimer();
+      setStatus(REFUSED_TEXT);
+    } else if (result.status >= 200 && result.status < 300) {
+      setStatus("server answering");
+    }
+  }).catch(function () {
+    var queued = readQueue();
+    if (item.op === "page") item.body.queued = true;
+    queued.push(item);
+    writeQueue(queued);
+    setStatus("server is not answering. " + queued.length + " waiting on this page.");
+    ensureTimer();
+  });
+}
+
+byId("date").addEventListener("click", function () {
+  act({op: "tap", cmd: "date"});
+});
+byId("hostname").addEventListener("click", function () {
+  act({op: "tap", cmd: "hostname"});
+});
+byId("list").addEventListener("click", function () {
+  act({op: "tap", cmd: "list"});
+});
+byId("check").addEventListener("change", function () {
+  act({
+    op: "page",
+    body: {
+      slug: PAGE,
+      kind: "check",
+      card_id: "demo-check",
+      text: byId("check").checked ? "checked" : "unchecked",
+      note: "ticked on the demo page",
+      ts: stamp()
+    }
+  });
+});
+byId("save").addEventListener("click", function () {
+  var text = byId("note").value;
+  if (!String(text).replace(/\s/g, "").length) {
+    byId("out").textContent = "note requires text";
+    return;
+  }
+  act({
+    op: "page",
+    body: {slug: PAGE, kind: "note", text: text, ts: stamp()}
+  });
+});
+
+if (tokensMissing()) {
+  setStatus(MISSING_TEXT);
+} else if (readQueue().length) {
+  ensureTimer();
+} else {
+  fetch(BASE + "/health", {cache: "no-store"}).then(function (response) {
+    setStatus(response.ok ? "server answering" : "server is not answering");
+  }).catch(function () {
+    setStatus("server is not answering");
+  });
+}
+</script>
+</body>
+</html>
